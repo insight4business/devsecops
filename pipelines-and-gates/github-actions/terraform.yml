@@ -1,0 +1,242 @@
+# ---------------------------------------------------------------------------
+# Terraform workflow template (GitHub Actions, AWS target)
+#
+#   validate  no cloud credential
+#   plan      READ-ONLY role through OIDC; saves the plan file
+#   apply     WRITE role through OIDC, behind an Environment with required
+#             reviewers; applies exactly the saved plan
+#   destroy   workflow_dispatch only, develop branch only, own Environment
+#
+# Copy to .github/workflows/terraform.yml and replace every <PLACEHOLDER>.
+# Nothing here describes a real environment.
+#
+# One-time setup in GitHub (not in this file):
+#   * IAM roles trusted by the GitHub OIDC provider with exact `sub` claims
+#     (see terraform/modules/aws-iam-oidc-pipeline-roles).
+#   * Repository variables (not secrets, ARNs are not secret):
+#       AWS_PLAN_ROLE_ARN_DEV   AWS_APPLY_ROLE_ARN_DEV
+#       AWS_PLAN_ROLE_ARN_PROD  AWS_APPLY_ROLE_ARN_PROD
+#   * Environments: dev, production, dev-destroy, each with Required reviewers
+#     (not the author) and "Deployment branches" limited (main for production,
+#     develop for dev and dev-destroy). The plan job does NOT use an
+#     Environment, so it never waits for approval.
+#   * Branch protection on main and develop: require pull request and this
+#     workflow's `validate` and `plan` checks.
+#   * Pin third-party actions to a full commit SHA in your own copy.
+# ---------------------------------------------------------------------------
+name: terraform
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - '<STACK_PATH>/**'
+      - 'modules/**'
+      - '.github/workflows/terraform.yml'
+  push:
+    branches: [main, develop]
+    paths:
+      - '<STACK_PATH>/**'
+      - 'modules/**'
+      - '.github/workflows/terraform.yml'
+  workflow_dispatch:
+    inputs:
+      destroy:
+        description: 'Destroy the dev stack (develop branch only)'
+        type: boolean
+        default: false
+
+# Default: no permission. Jobs request only what they need.
+permissions: {}
+
+# One run per branch at a time; never cancel an apply in progress.
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: '1.9.8'
+  TF_WORKING_DIR: '<STACK_PATH>' # for example infra/apps/contoso-portal
+  AWS_REGION: '<AWS_REGION>'     # for example us-east-1
+  TF_STATE_BUCKET: '<STATE_BUCKET>'
+  TF_IN_AUTOMATION: 'true'
+
+jobs:
+  # -------------------------------------------------------------------------
+  # validate: no credentials. Also decides the target environment:
+  # main -> prod; every other branch (develop and pull requests) -> dev.
+  # -------------------------------------------------------------------------
+  validate:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.destroy) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      env_name: ${{ steps.target.outputs.env_name }}
+      env_suffix: ${{ steps.target.outputs.env_suffix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - id: target
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ github.base_ref || github.ref_name }}
+        run: |
+          if [ "$TARGET_BRANCH" = "main" ]; then
+            echo "env_name=production" >> "$GITHUB_OUTPUT"
+            echo "env_suffix=PROD" >> "$GITHUB_OUTPUT"
+          else
+            echo "env_name=dev" >> "$GITHUB_OUTPUT"
+            echo "env_suffix=DEV" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: fmt, init -backend=false, validate
+        run: |
+          terraform -chdir="$TF_WORKING_DIR" fmt -check -recursive
+          terraform -chdir="$TF_WORKING_DIR" init -backend=false -input=false
+          terraform -chdir="$TF_WORKING_DIR" validate
+
+      # Optional security gates (see ../security-gates): add them as extra jobs
+      # or steps here (secret scan, IaC scan).
+
+  # -------------------------------------------------------------------------
+  # plan: read-only role. No Environment, so no approval wait.
+  # -------------------------------------------------------------------------
+  plan:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # request the OIDC token
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars[format('AWS_PLAN_ROLE_ARN_{0}', needs.validate.outputs.env_suffix)] }}
+          role-session-name: tf-plan-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Azure alternative: azure/login with client-id, tenant-id and
+          # subscription-id (no client secret) and ARM_USE_OIDC=true.
+
+      - name: terraform plan (saved)
+        run: |
+          terraform -chdir="$TF_WORKING_DIR" init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=${TF_WORKING_DIR}/${{ needs.validate.outputs.env_suffix }}.tfstate" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+          terraform -chdir="$TF_WORKING_DIR" plan -input=false -lock-timeout=5m -out=tfplan
+          terraform -chdir="$TF_WORKING_DIR" show -no-color tfplan > "$RUNNER_TEMP/plan.txt"
+          {
+            echo '## Terraform plan'
+            echo '```'
+            head -c 60000 "$RUNNER_TEMP/plan.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The plan file may contain sensitive values: short retention, restricted repository access.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 3
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # apply: only after merge (push), behind the Environment approval,
+  # with the write role. Applies the plan saved above.
+  # -------------------------------------------------------------------------
+  apply:
+    needs: [validate, plan]
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    environment: ${{ needs.validate.outputs.env_name }} # required reviewers live here
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ runner.temp }}/plan
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars[format('AWS_APPLY_ROLE_ARN_{0}', needs.validate.outputs.env_suffix)] }}
+          role-session-name: tf-apply-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform apply (saved plan)
+        run: |
+          terraform -chdir="$TF_WORKING_DIR" init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=${TF_WORKING_DIR}/${{ needs.validate.outputs.env_suffix }}.tfstate" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+          cp "$RUNNER_TEMP/plan/tfplan" "$TF_WORKING_DIR/tfplan"
+          # A stale plan (state changed since plan) is rejected: re-run the workflow.
+          terraform -chdir="$TF_WORKING_DIR" apply -input=false -lock-timeout=5m tfplan
+
+  # -------------------------------------------------------------------------
+  # destroy: manual dispatch with the input enabled, develop branch only,
+  # own Environment with its own reviewers.
+  # -------------------------------------------------------------------------
+  destroy:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.destroy && github.ref == 'refs/heads/develop' }}
+    runs-on: ubuntu-latest
+    environment: dev-destroy
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN_DEV }}
+          role-session-name: tf-destroy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform plan -destroy and apply
+        run: |
+          terraform -chdir="$TF_WORKING_DIR" init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=${TF_WORKING_DIR}/DEV.tfstate" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+          terraform -chdir="$TF_WORKING_DIR" plan -destroy -input=false -out=tfdestroy
+          terraform -chdir="$TF_WORKING_DIR" apply -input=false tfdestroy

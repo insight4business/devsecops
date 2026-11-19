@@ -1,0 +1,49 @@
+# Example pre-commit configuration (template).
+# Install:   pip install pre-commit   (or your package manager)
+#            pre-commit install
+# Run all:   pre-commit run --all-files
+# Update:    pre-commit autoupdate   (review the diff; keep revisions pinned)
+#
+# Local hooks are a convenience, not a control: they can be skipped.
+# Run the same checks in the pipeline (see ../pipelines).
+#
+# Requirements on the developer machine: terraform and gitleaks in the PATH.
+# Revisions below are examples: pin the versions your team has reviewed.
+repos:
+  # General hygiene and private key detection
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: ['--maxkb=1024']
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  # Secret scanning on staged changes
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+
+  # Terraform: format and validate
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.96.1
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate
+        # validate needs providers: it runs init without a backend.
+        args:
+          - --hook-config=--retry-once-with-cleanup=true
+      # Optional, uncomment if you use them:
+      # - id: terraform_docs
+      # - id: terraform_tflint
+      # - id: terraform_trivy
+
+  # YAML lint (pipelines, workflows)
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.35.1
+    hooks:
+      - id: yamllint
+        args: ['-c', '.yamllint.yaml']

@@ -1,0 +1,56 @@
+# RECOMMENDED gates (optional template) for Azure Pipelines: job snippets.
+# Add the jobs you need to the Validate stage of azure-pipelines.yml.
+# They are models, not a description of any existing pipeline.
+# Replace <PINNED_VERSION> values; pin tool versions.
+
+jobs:
+  - job: SecretScan
+    displayName: 'Gate: secrets (gitleaks)'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+      - checkout: self
+        fetchDepth: 0
+        persistCredentials: false
+      - script: |
+          set -euo pipefail
+          V=8.21.2
+          F="gitleaks_${V}_linux_x64.tar.gz"
+          B="https://github.com/gitleaks/gitleaks/releases/download/v${V}"
+          cd "$(Agent.TempDirectory)"
+          curl -fsSLO "${B}/${F}"
+          curl -fsSLO "${B}/gitleaks_${V}_checksums.txt"
+          grep " ${F}\$" "gitleaks_${V}_checksums.txt" | sha256sum -c -
+          tar -xzf "$F" gitleaks
+          sudo mv gitleaks /usr/local/bin/
+          cd "$(Build.SourcesDirectory)"
+          gitleaks git --redact --verbose --exit-code 1 .
+        displayName: 'gitleaks (any finding fails)'
+
+  - job: IacScan
+    displayName: 'Gate: IaC (trivy config)'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+      - checkout: self
+        persistCredentials: false
+      - script: |
+          docker run --rm -v "$(Build.SourcesDirectory):/work:ro" -w /work \
+            aquasec/trivy:<PINNED_VERSION> \
+            config --severity HIGH,CRITICAL --exit-code 1 .
+        displayName: 'trivy config (HIGH and CRITICAL fail)'
+
+  - job: DependencyAudit
+    displayName: 'Gate: SCA (npm audit)'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+      - checkout: self
+        persistCredentials: false
+      - task: NodeTool@0
+        inputs:
+          versionSpec: '20.x'
+      - script: |
+          npm ci --ignore-scripts
+          npm audit --omit=dev --audit-level=high
+        displayName: 'npm audit (high and critical fail)'

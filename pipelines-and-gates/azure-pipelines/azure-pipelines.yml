@@ -1,0 +1,247 @@
+# ---------------------------------------------------------------------------
+# Terraform pipeline template (Azure Pipelines)
+#
+#   Validate  no cloud credential: fmt, init -backend=false, validate
+#   Plan      READ-ONLY identity (Reader + state read). Saves the plan file.
+#   Apply     WRITE identity, behind an Environment with required approval.
+#             Applies exactly the plan saved by the Plan stage.
+#   Destroy   manual parameter only, develop branch only, own approval.
+#
+# Authentication: workload identity federation (OIDC) in the service
+# connections. There are no client secrets or keys in this pipeline.
+#
+# Replace every <PLACEHOLDER>. Nothing here describes a real environment.
+#
+# One-time setup in Azure DevOps (not in this file):
+#   * Service connections (type: Azure Resource Manager, workload identity
+#     federation), one pair per environment:
+#       sc-contoso-dev-plan   sc-contoso-dev-apply
+#       sc-contoso-prod-plan  sc-contoso-prod-apply
+#     The plan identity has Reader on the scope and read access to the state.
+#     The apply identity has the minimum write roles for this stack.
+#   * Environments with Approvals and checks: tf-dev, tf-prod, tf-dev-destroy.
+#     Add required approvers (not the author) and, if you want, branch control.
+#   * Variable groups tf-backend-dev and tf-backend-prod holding the (non
+#     secret) backend settings: tfStateResourceGroup, tfStateStorageAccount,
+#     tfStateContainer. Secrets, if unavoidable, come from a vault-linked group.
+#   * Branch policy on main and develop: build validation using this pipeline.
+# ---------------------------------------------------------------------------
+
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - <STACK_PATH>/**
+      - modules/**
+      - azure-pipelines.yml
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+parameters:
+  - name: runDestroy
+    displayName: 'Destroy dev stack (manual run on develop only)'
+    type: boolean
+    default: false
+
+variables:
+  - name: terraformVersion
+    value: '1.9.8'
+  - name: stackPath
+    value: '<STACK_PATH>' # for example infra/apps/contoso-portal
+  - name: subscriptionId
+    value: '<SUBSCRIPTION_ID>'
+  # main -> prod; every other branch (develop and pull requests) -> dev.
+  - ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/main') }}:
+      - name: envName
+        value: prod
+      - group: tf-backend-prod
+  - ${{ else }}:
+      - name: envName
+        value: dev
+      - group: tf-backend-dev
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  # -------------------------------------------------------------------------
+  # 1) VALIDATE: no credentials, nothing is created or read in the cloud.
+  # -------------------------------------------------------------------------
+  - stage: Validate
+    displayName: 'Validate'
+    jobs:
+      - job: Validate
+        steps:
+          - checkout: self
+            persistCredentials: false
+          - template: templates/install-terraform.yml
+            parameters:
+              version: $(terraformVersion)
+          - script: |
+              set -euo pipefail
+              terraform -chdir="$(stackPath)" fmt -check -recursive
+              terraform -chdir="$(stackPath)" init -backend=false -input=false
+              terraform -chdir="$(stackPath)" validate
+            displayName: 'terraform fmt, init -backend=false, validate'
+          # Optional security gates (see ../security-gates): add them here.
+          #   - secret scan (gitleaks)   - IaC scan (checkov or trivy)
+
+  # -------------------------------------------------------------------------
+  # 2) PLAN: read-only identity. Runs on pull requests and on pushes.
+  #    Pull request plans use the dev identity; prod is planned after merge.
+  # -------------------------------------------------------------------------
+  - stage: Plan
+    displayName: 'Plan (read-only identity)'
+    dependsOn: Validate
+    # A manual destroy run must not plan or apply the stack first.
+    condition: and(succeeded(), eq('${{ parameters.runDestroy }}', 'false'))
+    jobs:
+      - job: Plan
+        steps:
+          - checkout: self
+            persistCredentials: false
+          - template: templates/install-terraform.yml
+            parameters:
+              version: $(terraformVersion)
+          - task: AzureCLI@2
+            displayName: 'terraform plan (read-only service connection)'
+            inputs:
+              azureSubscription: 'sc-contoso-${{ variables.envName }}-plan'
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true # exposes servicePrincipalId, idToken, tenantId
+              workingDirectory: $(Build.SourcesDirectory)
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_OIDC_TOKEN="$idToken"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(subscriptionId)"
+                export ARM_USE_OIDC=true
+                export ARM_USE_AZUREAD=true   # state access through Entra ID, not account keys
+                terraform -chdir="$(stackPath)" init -input=false \
+                  -backend-config="resource_group_name=$(tfStateResourceGroup)" \
+                  -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+                  -backend-config="container_name=$(tfStateContainer)" \
+                  -backend-config="key=$(stackPath)/$(envName).tfstate"
+                terraform -chdir="$(stackPath)" plan -input=false -lock-timeout=5m -out=tfplan
+                terraform -chdir="$(stackPath)" show -no-color tfplan > "$(Build.ArtifactStagingDirectory)/plan.txt"
+                cp "$(stackPath)/tfplan" "$(Build.ArtifactStagingDirectory)/tfplan"
+              # Secrets, if any, must be mapped explicitly (they are not exported automatically):
+              #   env:
+              #     TF_VAR_example_secret: $(exampleSecret)
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: tfplan
+            displayName: 'Publish saved plan (may contain sensitive values: restrict access)'
+
+  # -------------------------------------------------------------------------
+  # 3) APPLY: write identity, behind the Environment approval.
+  #    Only after merge (push), never for pull requests.
+  # -------------------------------------------------------------------------
+  - stage: Apply
+    displayName: 'Apply (write identity, approval required)'
+    dependsOn: Plan
+    condition: >
+      and(
+        succeeded(),
+        ne(variables['Build.Reason'], 'PullRequest'),
+        in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/develop')
+      )
+    jobs:
+      - deployment: Apply
+        environment: 'tf-${{ variables.envName }}' # approvals are configured on this Environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  persistCredentials: false
+                - template: templates/install-terraform.yml
+                  parameters:
+                    version: $(terraformVersion)
+                - download: current
+                  artifact: tfplan
+                - task: AzureCLI@2
+                  displayName: 'terraform apply of the saved plan (write service connection)'
+                  inputs:
+                    azureSubscription: 'sc-contoso-${{ variables.envName }}-apply'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
+                    workingDirectory: $(Build.SourcesDirectory)
+                    inlineScript: |
+                      set -euo pipefail
+                      export ARM_CLIENT_ID="$servicePrincipalId"
+                      export ARM_OIDC_TOKEN="$idToken"
+                      export ARM_TENANT_ID="$tenantId"
+                      export ARM_SUBSCRIPTION_ID="$(subscriptionId)"
+                      export ARM_USE_OIDC=true
+                      export ARM_USE_AZUREAD=true
+                      terraform -chdir="$(stackPath)" init -input=false \
+                        -backend-config="resource_group_name=$(tfStateResourceGroup)" \
+                        -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+                        -backend-config="container_name=$(tfStateContainer)" \
+                        -backend-config="key=$(stackPath)/$(envName).tfstate"
+                      cp "$(Pipeline.Workspace)/tfplan/tfplan" "$(stackPath)/tfplan"
+                      # Applying a saved plan needs no -auto-approve. If state changed
+                      # since the plan, Terraform refuses the stale plan: re-run the pipeline.
+                      terraform -chdir="$(stackPath)" apply -input=false -lock-timeout=5m tfplan
+
+  # -------------------------------------------------------------------------
+  # 4) DESTROY: only by manual run, with the parameter on, on develop.
+  #    Never reachable from main, from a pull request or from a push.
+  # -------------------------------------------------------------------------
+  - stage: Destroy
+    displayName: 'Destroy (manual, develop only)'
+    dependsOn: Validate
+    condition: >
+      and(
+        succeeded(),
+        eq('${{ parameters.runDestroy }}', 'true'),
+        eq(variables['Build.Reason'], 'Manual'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/develop')
+      )
+    jobs:
+      - deployment: Destroy
+        environment: 'tf-dev-destroy' # separate Environment with its own approvers
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  persistCredentials: false
+                - template: templates/install-terraform.yml
+                  parameters:
+                    version: $(terraformVersion)
+                - task: AzureCLI@2
+                  displayName: 'terraform plan -destroy and apply (dev write service connection)'
+                  inputs:
+                    azureSubscription: 'sc-contoso-dev-apply'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
+                    workingDirectory: $(Build.SourcesDirectory)
+                    inlineScript: |
+                      set -euo pipefail
+                      export ARM_CLIENT_ID="$servicePrincipalId"
+                      export ARM_OIDC_TOKEN="$idToken"
+                      export ARM_TENANT_ID="$tenantId"
+                      export ARM_SUBSCRIPTION_ID="$(subscriptionId)"
+                      export ARM_USE_OIDC=true
+                      export ARM_USE_AZUREAD=true
+                      terraform -chdir="$(stackPath)" init -input=false \
+                        -backend-config="resource_group_name=$(tfStateResourceGroup)" \
+                        -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+                        -backend-config="container_name=$(tfStateContainer)" \
+                        -backend-config="key=$(stackPath)/dev.tfstate"
+                      terraform -chdir="$(stackPath)" plan -destroy -input=false -out=tfdestroy
+                      terraform -chdir="$(stackPath)" apply -input=false tfdestroy

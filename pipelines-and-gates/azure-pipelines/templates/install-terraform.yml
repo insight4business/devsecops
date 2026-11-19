@@ -1,0 +1,18 @@
+# Installs a pinned Terraform version and verifies its SHA-256 checksum.
+# For stronger assurance also verify the GPG signature of the SHA256SUMS file
+# (see the HashiCorp release verification documentation).
+parameters:
+  - name: version
+    type: string
+
+steps:
+  - script: |
+      set -euo pipefail
+      V="${{ parameters.version }}"
+      cd "$(Agent.TempDirectory)"
+      curl -fsSLO "https://releases.hashicorp.com/terraform/${V}/terraform_${V}_linux_amd64.zip"
+      curl -fsSLO "https://releases.hashicorp.com/terraform/${V}/terraform_${V}_SHA256SUMS"
+      grep "terraform_${V}_linux_amd64.zip" "terraform_${V}_SHA256SUMS" | sha256sum -c -
+      sudo unzip -o "terraform_${V}_linux_amd64.zip" -d /usr/local/bin
+      terraform version
+    displayName: 'Install Terraform ${{ parameters.version }} (checksum verified)'

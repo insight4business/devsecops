@@ -1,0 +1,40 @@
+# RECOMMENDED gate (optional template): SAST with CodeQL.
+# Requires GitHub code scanning (public repositories, or GitHub Advanced Security
+# for private ones). Not part of the default pipelines.
+name: gate-sast-codeql
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+  schedule:
+    - cron: '17 3 * * 1' # weekly, to catch new queries
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # upload results
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ['javascript-typescript'] # python, java-kotlin, csharp, go, ...
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended # security-and-quality is noisier
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:${{ matrix.language }}
+
+# Threshold: CodeQL itself does not fail the job. Enforce it in the repository:
+# Settings > Rules > Rulesets > "Require code scanning results", and choose
+# "High or higher" for security alerts (start there; later add Medium).

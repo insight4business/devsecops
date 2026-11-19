@@ -1,0 +1,103 @@
+# How to use: generic examples for a policy engine (Kyverno-style) and the native
+# ValidatingAdmissionPolicy (CEL). Start with validationFailureAction: Audit, review
+# the reports, then switch to Enforce. Replace <PLACEHOLDERS>. Not a statement of
+# what is deployed anywhere. Adjust API versions to your cluster.
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: contoso-restrict-image-registries
+  annotations:
+    policies.kyverno.io/title: Restrict image registries
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: allowed-registry
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      validate:
+        message: "Images must come from registry.example.com/contoso/."
+        pattern:
+          spec:
+            containers:
+              - image: "registry.example.com/contoso/*"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: contoso-require-non-root-and-no-privilege
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: non-root-no-escalation
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      validate:
+        message: "Containers must run as non-root and disallow privilege escalation."
+        pattern:
+          spec:
+            containers:
+              - securityContext:
+                  runAsNonRoot: true
+                  allowPrivilegeEscalation: false
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: contoso-verify-image-signature
+spec:
+  validationFailureAction: Audit
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: verify-signature
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      verifyImages:
+        - imageReferences: ["registry.example.com/contoso/*"]
+          attestors:
+            - entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      <PUBLIC_KEY_PLACEHOLDER>
+                      -----END PUBLIC KEY-----
+---
+# Native alternative (Kubernetes ValidatingAdmissionPolicy, CEL)
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: contoso-deny-privileged
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: >-
+        object.spec.containers.all(c,
+        !has(c.securityContext) || !has(c.securityContext.privileged) ||
+        c.securityContext.privileged == false)
+      message: "Privileged containers are not allowed."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: contoso-deny-privileged-binding
+spec:
+  policyName: contoso-deny-privileged
+  validationActions: ["Audit", "Warn"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        contoso.example.com/policy: enforced

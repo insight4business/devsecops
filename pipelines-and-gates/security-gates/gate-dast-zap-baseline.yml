@@ -1,0 +1,43 @@
+# RECOMMENDED gate (optional template): DAST baseline with OWASP ZAP.
+# The baseline scan is PASSIVE: it spiders the site briefly and inspects responses.
+# Run it only against a staging site you own and are authorized to test.
+# Not part of the default pipelines.
+name: gate-dast-zap
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 5 * * 2' # weekly
+
+permissions:
+  contents: read
+
+jobs:
+  zap-baseline:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_URL: https://staging.example.com # replace with your authorized staging URL
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Prepare output folder
+        run: mkdir -p zap-out && chmod 777 zap-out
+
+      # Exit codes: 0 pass, 1 at least one FAIL rule, 2 warnings only, 3 error.
+      # Threshold is set in zap-rules.conf (tab separated: <rule-id> <TAB> <FAIL|WARN|IGNORE> <TAB> <name>).
+      # Start with everything on WARN, then promote reliable rules to FAIL.
+      - name: ZAP baseline
+        run: >
+          docker run --rm -v "$PWD/zap-out:/zap/wrk:rw"
+          ghcr.io/zaproxy/zaproxy:<PINNED_VERSION>
+          zap-baseline.py -t "$TARGET_URL" -r zap-report.html -J zap-report.json -I
+
+      # Remove -I (ignore warnings) and add "-c zap-rules.conf" (mount it into /zap/wrk)
+      # once your rules file is ready, so that FAIL rules break the job.
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-report
+          path: zap-out/

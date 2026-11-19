@@ -1,0 +1,89 @@
+---
+# How to use: generic baseline hardening for Linux nodes. Put your own hosts in an
+# inventory outside this file (group name: <NODE_GROUP>). Run first with --check --diff
+# in a lab. Review every task against your OS vendor guidance before production.
+# Not a statement of what is deployed anywhere.
+- name: Contoso baseline hardening (example)
+  hosts: <NODE_GROUP>
+  become: true
+  vars:
+    ssh_permit_root_login: "no"
+    ssh_password_authentication: "no"
+    sysctl_settings:
+      net.ipv4.conf.all.rp_filter: 1
+      net.ipv4.conf.all.accept_redirects: 0
+      net.ipv4.conf.all.send_redirects: 0
+      net.ipv4.tcp_syncookies: 1
+      kernel.kptr_restrict: 2
+      kernel.dmesg_restrict: 1
+      fs.protected_hardlinks: 1
+      fs.protected_symlinks: 1
+    packages_absent: [telnet, rsh-server, tftp-server]
+    packages_present: [chrony, auditd]
+    ntp_server: ntp.example.com
+  tasks:
+    - name: Remove insecure packages
+      ansible.builtin.package:
+        name: "{{ packages_absent }}"
+        state: absent
+
+    - name: Install baseline packages
+      ansible.builtin.package:
+        name: "{{ packages_present }}"
+        state: present
+
+    - name: Harden SSH daemon
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?{{ item.key }}\\s"
+        line: "{{ item.key }} {{ item.value }}"
+        validate: "sshd -t -f %s"
+      loop:
+        - { key: PermitRootLogin, value: "{{ ssh_permit_root_login }}" }
+        - { key: PasswordAuthentication, value: "{{ ssh_password_authentication }}" }
+        - { key: X11Forwarding, value: "no" }
+        - { key: MaxAuthTries, value: "4" }
+        - { key: ClientAliveInterval, value: "300" }
+      notify: Restart sshd
+
+    - name: Apply kernel parameters
+      ansible.posix.sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/90-baseline.conf
+        reload: true
+      loop: "{{ sysctl_settings | dict2items }}"
+
+    - name: Point time sync to the internal server
+      ansible.builtin.lineinfile:
+        path: /etc/chrony.conf
+        regexp: "^server "
+        line: "server {{ ntp_server }} iburst"
+      notify: Restart chronyd
+
+    - name: Enable and start audit daemon
+      ansible.builtin.service:
+        name: auditd
+        state: started
+        enabled: true
+
+    - name: Restrict permissions on sensitive files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        mode: "{{ item.mode }}"
+        owner: root
+        group: root
+      loop:
+        - { path: /etc/passwd, mode: "0644" }
+        - { path: /etc/shadow, mode: "0000" }
+        - { path: /etc/ssh/sshd_config, mode: "0600" }
+
+  handlers:
+    - name: Restart sshd
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+    - name: Restart chronyd
+      ansible.builtin.service:
+        name: chronyd
+        state: restarted

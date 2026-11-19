@@ -1,0 +1,40 @@
+# RECOMMENDED gate (optional template): SAST with Semgrep (open-source engine).
+# Alternative or complement to CodeQL. Not part of the default pipelines.
+name: gate-sast-semgrep
+on:
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:<PINNED_VERSION> # pin the tag, ideally by digest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Threshold: --severity ERROR with --error fails on ERROR findings only.
+      # Tighten later by adding: --severity WARNING
+      # Rule sets: p/ci is a general baseline; add p/owasp-top-ten and a language pack.
+      - name: Scan
+        run: >
+          semgrep scan
+          --config p/ci
+          --config p/owasp-top-ten
+          --severity ERROR
+          --error
+          --metrics off
+          --sarif --output semgrep.sarif
+
+      # Suppress a false positive in code with a justified comment:
+      #   # nosemgrep: <rule-id> -- reason, owner, review date
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif

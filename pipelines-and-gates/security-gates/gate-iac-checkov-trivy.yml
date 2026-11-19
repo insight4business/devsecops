@@ -1,0 +1,45 @@
+# RECOMMENDED gate (optional template): infrastructure-as-code scanning.
+# Use Checkov, Trivy, or both. Not part of the default pipelines.
+name: gate-iac
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - '**.tf'
+      - '**.yml'
+      - '**.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  checkov:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install checkov==<PINNED_VERSION>
+      # Phase 1 (observe): add --soft-fail so findings are reported but never block.
+      # Phase 2 (enforce): remove --soft-fail. Every failed check blocks the pull request.
+      # Skip a check only with a reason, in code, next to the resource:
+      #   #checkov:skip=CKV_AWS_144: replication not required for dev logs (owner, review date)
+      - run: checkov -d . --framework terraform --compact --quiet
+
+  trivy-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Threshold: fail on HIGH and CRITICAL misconfigurations; MEDIUM is reported only.
+      # Add a second run with --severity MEDIUM and --exit-code 0 to report them.
+      - name: Trivy config scan
+        run: >
+          docker run --rm -v "$PWD:/work:ro" -w /work
+          aquasec/trivy:<PINNED_VERSION>
+          config --severity HIGH,CRITICAL --exit-code 1 .
+      # Accepted risk: list the ID in a .trivyignore file with a comment and expiry.

@@ -1,0 +1,56 @@
+# RECOMMENDED gate (optional template): software composition analysis (SCA).
+# Combine the jobs that match your stack. Not part of the default pipelines.
+name: gate-sca
+on:
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    - cron: '41 4 * * *' # nightly: new advisories appear without code changes
+
+permissions:
+  contents: read
+
+jobs:
+  # Blocks a pull request that INTRODUCES a vulnerable or disallowed dependency.
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high # threshold: high and critical
+          # deny-licenses: GPL-3.0-only # example license policy: set your own
+
+  # Node.js
+  npm-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci --ignore-scripts
+      # Threshold: fail on high or critical; devDependencies excluded from the gate.
+      - run: npm audit --omit=dev --audit-level=high
+
+  # Python
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pip-audit==<PINNED_VERSION>
+      # Fails on any known vulnerability in the pinned requirements.
+      # Use --ignore-vuln <ID> only with a justification, owner and expiry in the triage log.
+      - run: pip-audit -r requirements.txt --strict
